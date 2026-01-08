@@ -154,7 +154,6 @@ jobs:
           RUN_ID: ${{ inputs.run_id }}
         run: |
           set -euo pipefail
-
           # Best-effort: some outputs may be empty if earlier steps never ran
           C1_APPLY_OK="${{ steps.check1.outputs.golden_apply_ok }}"
           C1_EXIT="${{ steps.check1.outputs.golden_exit }}"
@@ -166,9 +165,9 @@ jobs:
           set +e
           curl -sS -X POST "$CALLBACK_URL" \
             -H "Content-Type: application/json" \
-            -d @- <<JSON
+            -d @- <<'JSON'
           {
-            "run_id": "$RUN_ID",
+            "run_id": "'"$RUN_ID"'",
             "repository": "${{ github.repository }}",
             "github_run_id": "${{ github.run_id }}",
             "github_run_attempt": "${{ github.run_attempt }}",
@@ -176,15 +175,15 @@ jobs:
             "commit_sha": "${{ inputs.commit_sha }}",
             "check1": {
               "name": "golden_only",
-              "patch_apply_ok": ${C1_APPLY_OK:-null},
-              "exit_code": ${C1_EXIT:-null}
+              "patch_apply_ok": "'"${C1_APPLY_OK:-null}"'",
+              "exit_code": "'"${C1_EXIT:-null}"'"
             },
             "check2": {
               "name": "golden_plus_test",
-              "patch_apply_ok": ${C2_APPLY_OK:-null},
-              "exit_code": ${C2_EXIT:-null}
+              "patch_apply_ok": "'"${C2_APPLY_OK:-null}"'",
+              "exit_code": "'"${C2_EXIT:-null}"'"
             },
-            "overall_ok": ${OVERALL_OK:-null}
+            "overall_ok": "'"${OVERALL_OK:-null}"'"
           }
-JSON
+          JSON
           true
