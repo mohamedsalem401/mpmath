@@ -43,25 +43,25 @@ jobs:
           export PATCHES_JSON="$(printf '%s' "$PATCHES_JSON_B64" | base64 -d)"
 
           cat > /tmp/decode_patches.py <<'PY'
-import json, base64, os, pathlib, sys
+          import json, base64, os, pathlib, sys
 
-arr = json.loads(os.environ["PATCHES_JSON"])
-if not isinstance(arr, list) or len(arr) < 2:
-    print("ERROR: Need at least 2 patches: [test_patch, golden_patch1, ...]", file=sys.stderr)
-    sys.exit(2)
+          arr = json.loads(os.environ["PATCHES_JSON"])
+          if not isinstance(arr, list) or len(arr) < 2:
+              print("ERROR: Need at least 2 patches", file=sys.stderr)
+              sys.exit(2)
 
-outdir = pathlib.Path("/tmp/patches")
-outdir.mkdir(parents=True, exist_ok=True)
+          outdir = pathlib.Path("/tmp/patches")
+          outdir.mkdir(parents=True, exist_ok=True)
 
-# Index 0 is the test patch
-(outdir / "test.patch").write_bytes(base64.b64decode(arr[0]))
+          # First patch = test.patch
+          (outdir / "test.patch").write_bytes(base64.b64decode(arr[0]))
 
-# Indices 1..n are golden patches
-for i, patch_b64 in enumerate(arr[1:], start=1):
-    (outdir / f"golden_{i:03d}.patch").write_bytes(base64.b64decode(patch_b64))
+          # Rest = golden patches
+          for i, patch_b64 in enumerate(arr[1:], start=1):
+              (outdir / f"golden_{i:03d}.patch").write_bytes(base64.b64decode(patch_b64))
 
-print(f"Wrote test.patch and {len(arr)-1} golden patch(es) to {outdir}")
-PY
+          print(f"Wrote {len(arr)-1} golden patches and test.patch")
+          PY
 
           python3 /tmp/decode_patches.py
 
