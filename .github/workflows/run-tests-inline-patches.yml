@@ -1,4 +1,4 @@
-name: Run tests with inline patches (Option B)
+name: Run tests with inline patches
 
 on:
   workflow_dispatch:
