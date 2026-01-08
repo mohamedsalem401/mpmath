@@ -54,12 +54,17 @@ jobs:
           git checkout --force "${{ inputs.commit_sha }}"
           git reset --hard; git clean -fdx
 
+          APPLY_OK=true
           for p in /tmp/patches/golden_*.patch; do
-            git apply "$p" 2>&1 | tee -a /tmp/logs/c1_apply.log || { echo "golden_exit=100" >>$GITHUB_OUTPUT; exit 0; }
+            git apply "$p" 2>&1 | tee -a /tmp/logs/c1_apply.log || { APPLY_OK=false; echo "golden_exit=100" >>$GITHUB_OUTPUT; break; }
           done
 
-          bash -lc "${{ inputs.test_cmd }}" 2>&1 | tee /tmp/logs/c1_test.log
-          echo "golden_exit=${PIPESTATUS[0]}" >>$GITHUB_OUTPUT
+          if [ "$APPLY_OK" = true ]; then
+            bash -lc "${{ inputs.test_cmd }}" 2>&1 | tee /tmp/logs/c1_test.log
+            echo "golden_exit=${PIPESTATUS[0]}" >>$GITHUB_OUTPUT
+          fi
+
+          echo "golden_apply_ok=$APPLY_OK" >>$GITHUB_OUTPUT
           exit 0
 
       - name: Check2 – golden + test
@@ -70,14 +75,21 @@ jobs:
           git checkout --force "${{ inputs.commit_sha }}"
           git reset --hard; git clean -fdx
 
+          APPLY_OK=true
           for p in /tmp/patches/golden_*.patch; do
-            git apply "$p" 2>&1 | tee -a /tmp/logs/c2_apply.log || { echo "combined_exit=100" >>$GITHUB_OUTPUT; exit 0; }
+            git apply "$p" 2>&1 | tee -a /tmp/logs/c2_apply.log || { APPLY_OK=false; echo "combined_exit=100" >>$GITHUB_OUTPUT; break; }
           done
 
-          git apply /tmp/patches/test.patch 2>&1 | tee -a /tmp/logs/c2_apply.log || { echo "combined_exit=101" >>$GITHUB_OUTPUT; exit 0; }
+          if [ "$APPLY_OK" = true ]; then
+            git apply /tmp/patches/test.patch 2>&1 | tee -a /tmp/logs/c2_apply.log || { APPLY_OK=false; echo "combined_exit=101" >>$GITHUB_OUTPUT; }
+          fi
 
-          bash -lc "${{ inputs.test_cmd }}" 2>&1 | tee /tmp/logs/c2_test.log
-          echo "combined_exit=${PIPESTATUS[0]}" >>$GITHUB_OUTPUT
+          if [ "$APPLY_OK" = true ]; then
+            bash -lc "${{ inputs.test_cmd }}" 2>&1 | tee /tmp/logs/c2_test.log
+            echo "combined_exit=${PIPESTATUS[0]}" >>$GITHUB_OUTPUT
+          fi
+
+          echo "combined_apply_ok=$APPLY_OK" >>$GITHUB_OUTPUT
           exit 0
 
       - name: Callback to n8n
@@ -86,11 +98,12 @@ jobs:
         env:
           CALLBACK_URL: ${{ inputs.callback_url }}
           RUN_ID: ${{ inputs.run_id }}
+          C1_APPLY_OK: ${{ steps.check1.outputs.golden_apply_ok }}
           C1_EXIT: ${{ steps.check1.outputs.golden_exit }}
+          C2_APPLY_OK: ${{ steps.check2.outputs.combined_apply_ok }}
           C2_EXIT: ${{ steps.check2.outputs.combined_exit }}
         run: |
           set -euo pipefail
-
           tailb(){ [ -f "$1" ] && tail -c 900000 "$1" | base64 -w0 || echo ""; }
 
           C1_B64="$(tailb /tmp/logs/c1_test.log)"
@@ -100,16 +113,23 @@ jobs:
 
           python3 - <<'PY' | curl -sS -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -d @-
           import json, os
+
+          def to_bool(v):
+              return str(v).lower() in ("1","true","yes","on")
+
           payload = {
             "run_id": os.environ["RUN_ID"],
             "repo": os.environ["GITHUB_REPOSITORY"],
             "github_run": os.environ["GITHUB_RUN_ID"],
             "commit": "${{ inputs.commit_sha }}",
             "check1_exit": int(os.environ.get("C1_EXIT","100")),
-            "check2_exit": int(os.environ.get("C2_EXIT","100")),
+            "check1_apply_ok": to_bool(os.environ.get("C1_APPLY_OK")),
             "check1_log_b64": os.environ.get("C1_B64",""),
+            "check2_exit": int(os.environ.get("C2_EXIT","100")),
+            "check2_apply_ok": to_bool(os.environ.get("C2_APPLY_OK")),
             "check2_log_b64": os.environ.get("C2_B64","")
           }
+
           print(json.dumps(payload))
           PY
           true
