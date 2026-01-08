@@ -152,38 +152,54 @@ jobs:
         env:
           CALLBACK_URL: ${{ inputs.callback_url }}
           RUN_ID: ${{ inputs.run_id }}
+          C1_APPLY_OK: ${{ steps.check1.outputs.golden_apply_ok }}
+          C1_EXIT: ${{ steps.check1.outputs.golden_exit }}
+          C2_APPLY_OK: ${{ steps.check2.outputs.combined_apply_ok }}
+          C2_EXIT: ${{ steps.check2.outputs.combined_exit }}
+          OVERALL_OK: ${{ steps.overall.outputs.ok }}
         run: |
           set -euo pipefail
-          # Best-effort: some outputs may be empty if earlier steps never ran
-          C1_APPLY_OK="${{ steps.check1.outputs.golden_apply_ok }}"
-          C1_EXIT="${{ steps.check1.outputs.golden_exit }}"
-          C2_APPLY_OK="${{ steps.check2.outputs.combined_apply_ok }}"
-          C2_EXIT="${{ steps.check2.outputs.combined_exit }}"
-          OVERALL_OK="${{ steps.overall.outputs.ok }}"
 
-          # Use curl; never fail the workflow because callback failed
+          # Defaults if earlier steps never produced outputs
+          C1_APPLY_OK="${C1_APPLY_OK:-false}"
+          C1_EXIT="${C1_EXIT:-100}"
+          C2_APPLY_OK="${C2_APPLY_OK:-false}"
+          C2_EXIT="${C2_EXIT:-100}"
+          OVERALL_OK="${OVERALL_OK:-false}"
+
           set +e
-          curl -sS -X POST "$CALLBACK_URL" \
-            -H "Content-Type: application/json" \
-            -d @- <<'JSON'
-          {
-            "run_id": "'"$RUN_ID"'",
-            "repository": "${{ github.repository }}",
-            "github_run_id": "${{ github.run_id }}",
-            "github_run_attempt": "${{ github.run_attempt }}",
-            "html_url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-            "commit_sha": "${{ inputs.commit_sha }}",
-            "check1": {
-              "name": "golden_only",
-              "patch_apply_ok": "'"${C1_APPLY_OK:-null}"'",
-              "exit_code": "'"${C1_EXIT:-null}"'"
-            },
-            "check2": {
-              "name": "golden_plus_test",
-              "patch_apply_ok": "'"${C2_APPLY_OK:-null}"'",
-              "exit_code": "'"${C2_EXIT:-null}"'"
-            },
-            "overall_ok": "'"${OVERALL_OK:-null}"'"
+          python3 - <<'PY' | curl -sS -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -d @-
+          import json, os
+
+          def to_bool(s):
+              return str(s).lower() in ("1","true","yes","y","on")
+
+          def to_int(s, default=None):
+              try:
+                  return int(s)
+              except Exception:
+                  return default
+
+          payload = {
+              "run_id": os.environ.get("RUN_ID"),
+              "repository": os.environ.get("GITHUB_REPOSITORY"),
+              "github_run_id": os.environ.get("GITHUB_RUN_ID"),
+              "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+              "html_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+              "commit_sha": "${{ inputs.commit_sha }}",
+              "check1": {
+                  "name": "golden_only",
+                  "patch_apply_ok": to_bool(os.environ.get("C1_APPLY_OK")),
+                  "exit_code": to_int(os.environ.get("C1_EXIT"), 100),
+              },
+              "check2": {
+                  "name": "golden_plus_test",
+                  "patch_apply_ok": to_bool(os.environ.get("C2_APPLY_OK")),
+                  "exit_code": to_int(os.environ.get("C2_EXIT"), 100),
+              },
+              "overall_ok": to_bool(os.environ.get("OVERALL_OK")),
           }
-          JSON
+
+          print(json.dumps(payload))
+          PY
           true
