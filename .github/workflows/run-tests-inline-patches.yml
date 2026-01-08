@@ -1,0 +1,64 @@
+name: Run tests with inline patches
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: "Commit SHA to checkout"
+        required: true
+        type: string
+      patches_json_b64:
+        description: "Base64(JSON array of base64 patches)"
+        required: true
+        type: string
+      test_cmd:
+        description: "Test command to run"
+        required: true
+        type: string
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout --force "${{ inputs.commit_sha }}"
+
+      - name: Decode patches and apply in order
+        shell: bash
+        env:
+          PATCHES_JSON_B64: ${{ inputs.patches_json_b64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/patches
+          export PATCHES_JSON="$(printf '%s' "$PATCHES_JSON_B64" | base64 -d)"
+
+          python3 - <<'PY'
+import json, base64, os, pathlib
+arr = json.loads(os.environ["PATCHES_JSON"])
+if not isinstance(arr, list) or not arr:
+    raise SystemExit("patch list is empty or invalid")
+outdir = pathlib.Path("/tmp/patches")
+outdir.mkdir(parents=True, exist_ok=True)
+for i, patch_b64 in enumerate(arr):
+    (outdir / f"patch_{i:03d}.patch").write_bytes(base64.b64decode(patch_b64))
+print(f"Wrote {len(arr)} patch file(s)")
+PY
+
+          for p in /tmp/patches/patch_*.patch; do
+            echo "Applying $p"
+            git apply --whitespace=nowarn "$p"
+          done
+
+      - name: Run tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -lc "${{ inputs.test_cmd }}"
