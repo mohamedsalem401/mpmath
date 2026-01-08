@@ -1,0 +1,130 @@
+name: Run tests with inline patches (Option B)
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: "Commit SHA to checkout"
+        required: true
+      patches_json_b64:
+        description: >
+          Base64 of a JSON array of base64-encoded patches.
+          Example decoded JSON: ["<patch1_b64>", "<patch2_b64>"]
+        required: true
+      test_cmd:
+        description: "Test command to run"
+        required: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout --force "${{ inputs.commit_sha }}"
+
+      - name: Decode patches and apply in order
+        shell: bash
+        env:
+          PATCHES_JSON_B64: ${{ inputs.patches_json_b64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/patches
+
+          # Decode PATCHES_JSON_B64 -> JSON text
+          PATCHES_JSON="$(printf '%s' "$PATCHES_JSON_B64" | base64 -d)"
+
+          # Use Python (available on ubuntu-latest) to:
+          # - parse JSON array
+          # - base64-decode each patch
+          # - write patch files in order
+          python3 - <<'PY'
+import os, json, base64, sys, pathlib
+
+patches_json = os.environ.get("PATCHES_JSON", "")
+if not patches_json:
+    print("ERROR: PATCHES_JSON is empty after decoding.", file=sys.stderr)
+    sys.exit(2)
+
+try:
+    arr = json.loads(patches_json)
+except Exception as e:
+    print(f"ERROR: Failed to parse JSON: {e}", file=sys.stderr)
+    sys.exit(2)
+
+if not isinstance(arr, list) or not arr:
+    print("ERROR: JSON must be a non-empty array.", file=sys.stderr)
+    sys.exit(2)
+
+outdir = pathlib.Path("/tmp/patches")
+outdir.mkdir(parents=True, exist_ok=True)
+
+for i, patch_b64 in enumerate(arr):
+    if not isinstance(patch_b64, str) or not patch_b64.strip():
+        print(f"ERROR: Patch at index {i} must be a non-empty base64 string.", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        patch_bytes = base64.b64decode(patch_b64, validate=False)
+    except Exception as e:
+        print(f"ERROR: Failed to base64-decode patch[{i}]: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    path = outdir / f"patch_{i:03d}.patch"
+    path.write_bytes(patch_bytes)
+
+print(f"Wrote {len(arr)} patch file(s) to /tmp/patches")
+PY
+        # pass decoded JSON into python via env (safer than heredoc interpolation)
+        env:
+          PATCHES_JSON: ${{ fromJSON('["dummy"]') }} # placeholder; overwritten below
+        # GitHub Actions doesn't allow setting env dynamically in the YAML field above.
+        # We'll export PATCHES_JSON just before invoking python by re-decoding it here:
+        # (We do it by overriding PATCHES_JSON in bash)
+        # So adjust: re-run python with PATCHES_JSON exported from bash:
+        # NOTE: The python step above expects PATCHES_JSON in env; we set it right here:
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/patches
+          export PATCHES_JSON="$(printf '%s' "${{ inputs.patches_json_b64 }}" | base64 -d)"
+
+          python3 - <<'PY'
+import os, json, base64, sys, pathlib
+
+patches_json = os.environ.get("PATCHES_JSON", "")
+if not patches_json:
+    print("ERROR: PATCHES_JSON is empty after decoding.", file=sys.stderr)
+    sys.exit(2)
+
+arr = json.loads(patches_json)
+if not isinstance(arr, list) or not arr:
+    print("ERROR: JSON must be a non-empty array.", file=sys.stderr)
+    sys.exit(2)
+
+outdir = pathlib.Path("/tmp/patches")
+outdir.mkdir(parents=True, exist_ok=True)
+
+for i, patch_b64 in enumerate(arr):
+    patch_bytes = base64.b64decode(patch_b64)
+    (outdir / f"patch_{i:03d}.patch").write_bytes(patch_bytes)
+
+print(f"Wrote {len(arr)} patch file(s) to /tmp/patches")
+PY
+
+          for p in /tmp/patches/patch_*.patch; do
+            echo "Applying $p"
+            git apply --whitespace=nowarn "$p"
+          done
+
+      - name: Run tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -lc "${{ inputs.test_cmd }}"
