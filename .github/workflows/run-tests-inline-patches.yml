@@ -4,23 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       commit_sha:
-        description: "Commit SHA to checkout"
         required: true
         type: string
       patches_json_b64:
-        description: "Base64(JSON array of base64-encoded patches). First element is test patch; remaining are golden patches."
         required: true
         type: string
       test_cmd:
-        description: "Test command to run"
         required: true
         type: string
       callback_url:
-        description: "Webhook URL to call with results"
         required: true
         type: string
       run_id:
-        description: "Caller-provided correlation id"
         required: true
         type: string
 
@@ -28,123 +23,62 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout (full history)
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Decode patches to files
+      - name: Decode patches
         shell: bash
         env:
           PATCHES_JSON_B64: ${{ inputs.patches_json_b64 }}
         run: |
           set -euo pipefail
-          mkdir -p /tmp/patches
+          mkdir -p /tmp/patches /tmp/logs
           export PATCHES_JSON="$(printf '%s' "$PATCHES_JSON_B64" | base64 -d)"
 
-          cat > /tmp/decode_patches.py <<'PY'
-          import json, base64, os, pathlib, sys
-
+          cat > /tmp/decode.py <<'PY'
+          import json, base64, os, pathlib
           arr = json.loads(os.environ["PATCHES_JSON"])
-          if not isinstance(arr, list) or len(arr) < 2:
-              print("ERROR: Need at least 2 patches", file=sys.stderr)
-              sys.exit(2)
-
-          outdir = pathlib.Path("/tmp/patches")
-          outdir.mkdir(parents=True, exist_ok=True)
-
-          # First patch = test.patch
-          (outdir / "test.patch").write_bytes(base64.b64decode(arr[0]))
-
-          # Rest = golden patches
-          for i, patch_b64 in enumerate(arr[1:], start=1):
-              (outdir / f"golden_{i:03d}.patch").write_bytes(base64.b64decode(patch_b64))
-
-          print(f"Wrote {len(arr)-1} golden patches and test.patch")
+          out = pathlib.Path("/tmp/patches"); out.mkdir(parents=True, exist_ok=True)
+          (out / "test.patch").write_bytes(base64.b64decode(arr[0]))
+          for i,p in enumerate(arr[1:],1):
+              (out / f"golden_{i:03d}.patch").write_bytes(base64.b64decode(p))
           PY
+          python3 /tmp/decode.py
 
-          python3 /tmp/decode_patches.py
-
-      - name: Check 1 - golden patches only (must pass)
+      - name: Check1 – golden only
         id: check1
         shell: bash
         run: |
-          set +e  # capture exit code ourselves
-          set -o pipefail
-
+          set +e; set -o pipefail
           git checkout --force "${{ inputs.commit_sha }}"
-          git reset --hard
-          git clean -fdx
+          git reset --hard; git clean -fdx
 
           for p in /tmp/patches/golden_*.patch; do
-            echo "Applying $p"
-            git apply --whitespace=nowarn "$p"
-            if [ $? -ne 0 ]; then
-              echo "golden_apply_ok=false" >> "$GITHUB_OUTPUT"
-              echo "golden_exit=100" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
+            git apply "$p" 2>&1 | tee -a /tmp/logs/c1_apply.log || { echo "golden_exit=100" >>$GITHUB_OUTPUT; exit 0; }
           done
 
-          bash -lc "${{ inputs.test_cmd }}"
-          code=$?
-
-          echo "golden_apply_ok=true" >> "$GITHUB_OUTPUT"
-          echo "golden_exit=$code" >> "$GITHUB_OUTPUT"
+          bash -lc "${{ inputs.test_cmd }}" 2>&1 | tee /tmp/logs/c1_test.log
+          echo "golden_exit=${PIPESTATUS[0]}" >>$GITHUB_OUTPUT
           exit 0
 
-      - name: Check 2 - golden + test patch (must pass)
+      - name: Check2 – golden + test
         id: check2
         shell: bash
         run: |
-          set +e
-          set -o pipefail
-
+          set +e; set -o pipefail
           git checkout --force "${{ inputs.commit_sha }}"
-          git reset --hard
-          git clean -fdx
+          git reset --hard; git clean -fdx
 
           for p in /tmp/patches/golden_*.patch; do
-            echo "Applying $p"
-            git apply --whitespace=nowarn "$p"
-            if [ $? -ne 0 ]; then
-              echo "combined_apply_ok=false" >> "$GITHUB_OUTPUT"
-              echo "combined_exit=100" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
+            git apply "$p" 2>&1 | tee -a /tmp/logs/c2_apply.log || { echo "combined_exit=100" >>$GITHUB_OUTPUT; exit 0; }
           done
 
-          echo "Applying /tmp/patches/test.patch"
-          git apply --whitespace=nowarn /tmp/patches/test.patch
-          if [ $? -ne 0 ]; then
-            echo "combined_apply_ok=false" >> "$GITHUB_OUTPUT"
-            echo "combined_exit=101" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          git apply /tmp/patches/test.patch 2>&1 | tee -a /tmp/logs/c2_apply.log || { echo "combined_exit=101" >>$GITHUB_OUTPUT; exit 0; }
 
-          bash -lc "${{ inputs.test_cmd }}"
-          code=$?
-
-          echo "combined_apply_ok=true" >> "$GITHUB_OUTPUT"
-          echo "combined_exit=$code" >> "$GITHUB_OUTPUT"
+          bash -lc "${{ inputs.test_cmd }}" 2>&1 | tee /tmp/logs/c2_test.log
+          echo "combined_exit=${PIPESTATUS[0]}" >>$GITHUB_OUTPUT
           exit 0
-
-      - name: Determine overall result
-        id: overall
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          c1="${{ steps.check1.outputs.golden_exit }}"
-          c2="${{ steps.check2.outputs.combined_exit }}"
-
-          # Pass criteria per your spec: both checks should pass tests (exit 0),
-          # and patch application should be OK (we encode apply failures as 100/101).
-          if [ "$c1" = "0" ] && [ "$c2" = "0" ]; then
-            echo "ok=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Callback to n8n
         if: always()
@@ -152,54 +86,30 @@ jobs:
         env:
           CALLBACK_URL: ${{ inputs.callback_url }}
           RUN_ID: ${{ inputs.run_id }}
-          C1_APPLY_OK: ${{ steps.check1.outputs.golden_apply_ok }}
           C1_EXIT: ${{ steps.check1.outputs.golden_exit }}
-          C2_APPLY_OK: ${{ steps.check2.outputs.combined_apply_ok }}
           C2_EXIT: ${{ steps.check2.outputs.combined_exit }}
-          OVERALL_OK: ${{ steps.overall.outputs.ok }}
         run: |
           set -euo pipefail
 
-          # Defaults if earlier steps never produced outputs
-          C1_APPLY_OK="${C1_APPLY_OK:-false}"
-          C1_EXIT="${C1_EXIT:-100}"
-          C2_APPLY_OK="${C2_APPLY_OK:-false}"
-          C2_EXIT="${C2_EXIT:-100}"
-          OVERALL_OK="${OVERALL_OK:-false}"
+          tailb(){ [ -f "$1" ] && tail -c 900000 "$1" | base64 -w0 || echo ""; }
 
-          set +e
+          C1_B64="$(tailb /tmp/logs/c1_test.log)"
+          C2_B64="$(tailb /tmp/logs/c2_test.log)"
+
+          export C1_B64 C2_B64
+
           python3 - <<'PY' | curl -sS -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -d @-
           import json, os
-
-          def to_bool(s):
-              return str(s).lower() in ("1","true","yes","y","on")
-
-          def to_int(s, default=None):
-              try:
-                  return int(s)
-              except Exception:
-                  return default
-
           payload = {
-              "run_id": os.environ.get("RUN_ID"),
-              "repository": os.environ.get("GITHUB_REPOSITORY"),
-              "github_run_id": os.environ.get("GITHUB_RUN_ID"),
-              "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
-              "html_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
-              "commit_sha": "${{ inputs.commit_sha }}",
-              "check1": {
-                  "name": "golden_only",
-                  "patch_apply_ok": to_bool(os.environ.get("C1_APPLY_OK")),
-                  "exit_code": to_int(os.environ.get("C1_EXIT"), 100),
-              },
-              "check2": {
-                  "name": "golden_plus_test",
-                  "patch_apply_ok": to_bool(os.environ.get("C2_APPLY_OK")),
-                  "exit_code": to_int(os.environ.get("C2_EXIT"), 100),
-              },
-              "overall_ok": to_bool(os.environ.get("OVERALL_OK")),
+            "run_id": os.environ["RUN_ID"],
+            "repo": os.environ["GITHUB_REPOSITORY"],
+            "github_run": os.environ["GITHUB_RUN_ID"],
+            "commit": "${{ inputs.commit_sha }}",
+            "check1_exit": int(os.environ.get("C1_EXIT","100")),
+            "check2_exit": int(os.environ.get("C2_EXIT","100")),
+            "check1_log_b64": os.environ.get("C1_B64",""),
+            "check2_log_b64": os.environ.get("C2_B64","")
           }
-
           print(json.dumps(payload))
           PY
           true
