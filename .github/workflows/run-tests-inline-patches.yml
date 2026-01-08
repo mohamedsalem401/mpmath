@@ -8,11 +8,19 @@ on:
         required: true
         type: string
       patches_json_b64:
-        description: "Base64(JSON array of base64-encoded patches)"
+        description: "Base64(JSON array of base64-encoded patches). First element is test patch; remaining are golden patches."
         required: true
         type: string
       test_cmd:
         description: "Test command to run"
+        required: true
+        type: string
+      callback_url:
+        description: "Webhook URL to call with results"
+        required: true
+        type: string
+      run_id:
+        description: "Caller-provided correlation id"
         required: true
         type: string
 
@@ -25,13 +33,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Checkout commit
-        shell: bash
-        run: |
-          set -euo pipefail
-          git checkout --force "${{ inputs.commit_sha }}"
-
-      - name: Decode patches and apply in order
+      - name: Decode patches to files
         shell: bash
         env:
           PATCHES_JSON_B64: ${{ inputs.patches_json_b64 }}
@@ -40,29 +42,149 @@ jobs:
           mkdir -p /tmp/patches
           export PATCHES_JSON="$(printf '%s' "$PATCHES_JSON_B64" | base64 -d)"
 
-          python3 - <<'PY'
-          import json, base64, os, pathlib
+          cat > /tmp/decode_patches.py <<'PY'
+import json, base64, os, pathlib, sys
 
-          arr = json.loads(os.environ["PATCHES_JSON"])
-          if not isinstance(arr, list) or not arr:
-              raise SystemExit("ERROR: JSON must be a non-empty array of base64 patches")
+arr = json.loads(os.environ["PATCHES_JSON"])
+if not isinstance(arr, list) or len(arr) < 2:
+    print("ERROR: Need at least 2 patches: [test_patch, golden_patch1, ...]", file=sys.stderr)
+    sys.exit(2)
 
-          outdir = pathlib.Path("/tmp/patches")
-          outdir.mkdir(parents=True, exist_ok=True)
+outdir = pathlib.Path("/tmp/patches")
+outdir.mkdir(parents=True, exist_ok=True)
 
-          for i, patch_b64 in enumerate(arr):
-              (outdir / f"patch_{i:03d}.patch").write_bytes(base64.b64decode(patch_b64))
+# Index 0 is the test patch
+(outdir / "test.patch").write_bytes(base64.b64decode(arr[0]))
 
-          print(f"Wrote {len(arr)} patch file(s) to {outdir}")
-          PY
+# Indices 1..n are golden patches
+for i, patch_b64 in enumerate(arr[1:], start=1):
+    (outdir / f"golden_{i:03d}.patch").write_bytes(base64.b64decode(patch_b64))
 
-          for p in /tmp/patches/patch_*.patch; do
+print(f"Wrote test.patch and {len(arr)-1} golden patch(es) to {outdir}")
+PY
+
+          python3 /tmp/decode_patches.py
+
+      - name: Check 1 - golden patches only (must pass)
+        id: check1
+        shell: bash
+        run: |
+          set +e  # capture exit code ourselves
+          set -o pipefail
+
+          git checkout --force "${{ inputs.commit_sha }}"
+          git reset --hard
+          git clean -fdx
+
+          for p in /tmp/patches/golden_*.patch; do
             echo "Applying $p"
             git apply --whitespace=nowarn "$p"
+            if [ $? -ne 0 ]; then
+              echo "golden_apply_ok=false" >> "$GITHUB_OUTPUT"
+              echo "golden_exit=100" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           done
 
-      - name: Run tests
+          bash -lc "${{ inputs.test_cmd }}"
+          code=$?
+
+          echo "golden_apply_ok=true" >> "$GITHUB_OUTPUT"
+          echo "golden_exit=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Check 2 - golden + test patch (must pass)
+        id: check2
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+
+          git checkout --force "${{ inputs.commit_sha }}"
+          git reset --hard
+          git clean -fdx
+
+          for p in /tmp/patches/golden_*.patch; do
+            echo "Applying $p"
+            git apply --whitespace=nowarn "$p"
+            if [ $? -ne 0 ]; then
+              echo "combined_apply_ok=false" >> "$GITHUB_OUTPUT"
+              echo "combined_exit=100" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+
+          echo "Applying /tmp/patches/test.patch"
+          git apply --whitespace=nowarn /tmp/patches/test.patch
+          if [ $? -ne 0 ]; then
+            echo "combined_apply_ok=false" >> "$GITHUB_OUTPUT"
+            echo "combined_exit=101" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          bash -lc "${{ inputs.test_cmd }}"
+          code=$?
+
+          echo "combined_apply_ok=true" >> "$GITHUB_OUTPUT"
+          echo "combined_exit=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Determine overall result
+        id: overall
         shell: bash
         run: |
           set -euo pipefail
-          bash -lc "${{ inputs.test_cmd }}"
+
+          c1="${{ steps.check1.outputs.golden_exit }}"
+          c2="${{ steps.check2.outputs.combined_exit }}"
+
+          # Pass criteria per your spec: both checks should pass tests (exit 0),
+          # and patch application should be OK (we encode apply failures as 100/101).
+          if [ "$c1" = "0" ] && [ "$c2" = "0" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Callback to n8n
+        if: always()
+        shell: bash
+        env:
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+
+          # Best-effort: some outputs may be empty if earlier steps never ran
+          C1_APPLY_OK="${{ steps.check1.outputs.golden_apply_ok }}"
+          C1_EXIT="${{ steps.check1.outputs.golden_exit }}"
+          C2_APPLY_OK="${{ steps.check2.outputs.combined_apply_ok }}"
+          C2_EXIT="${{ steps.check2.outputs.combined_exit }}"
+          OVERALL_OK="${{ steps.overall.outputs.ok }}"
+
+          # Use curl; never fail the workflow because callback failed
+          set +e
+          curl -sS -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -d @- <<JSON
+          {
+            "run_id": "$RUN_ID",
+            "repository": "${{ github.repository }}",
+            "github_run_id": "${{ github.run_id }}",
+            "github_run_attempt": "${{ github.run_attempt }}",
+            "html_url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "commit_sha": "${{ inputs.commit_sha }}",
+            "check1": {
+              "name": "golden_only",
+              "patch_apply_ok": ${C1_APPLY_OK:-null},
+              "exit_code": ${C1_EXIT:-null}
+            },
+            "check2": {
+              "name": "golden_plus_test",
+              "patch_apply_ok": ${C2_APPLY_OK:-null},
+              "exit_code": ${C2_EXIT:-null}
+            },
+            "overall_ok": ${OVERALL_OK:-null}
+          }
+JSON
+          true
