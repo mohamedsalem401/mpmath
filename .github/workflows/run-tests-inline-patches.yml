@@ -4,107 +4,190 @@ on:
   workflow_dispatch:
     inputs:
       commit_sha:
-        description: "Commit SHA to checkout"
         required: true
         type: string
 
       test_patch_b64:
-        description: "Base64-encoded *test* patch (git apply format)"
         required: true
         type: string
 
       golden_patch_b64:
-        description: "Base64-encoded *golden* patch (git apply format)"
         required: true
         type: string
 
       base_patch_b64:
-        description: "Base64-encoded *base* patch (optional; git apply format)"
         required: false
         default: ""
         type: string
 
       test_cmd:
-        description: "Test command to run"
+        required: true
+        type: string
+
+      callback_url:
+        required: true
+        type: string
+
+      submission_id:
         required: true
         type: string
 
 jobs:
   test:
-    name: "${{ matrix.run_name }}"
     runs-on: ubuntu-latest
 
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - run_name: "base(+?) + golden"
-            apply_golden: true
-            apply_test: false
-          - run_name: "base(+?) + test"
-            apply_golden: false
-            apply_test: true
-          - run_name: "base(+?) + golden + test"
-            apply_golden: true
-            apply_test: true
-
     steps:
-      - name: Checkout (full history)
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Checkout commit
-        shell: bash
-        run: |
-          set -euo pipefail
-          git checkout --force "${{ inputs.commit_sha }}"
-
-      - name: Apply patches (base -> golden -> test)
+      - name: Decode patches
         shell: bash
         env:
-          BASE_PATCH_B64: ${{ inputs.base_patch_b64 }}
-          GOLDEN_PATCH_B64: ${{ inputs.golden_patch_b64 }}
           TEST_PATCH_B64: ${{ inputs.test_patch_b64 }}
-          APPLY_GOLDEN: ${{ matrix.apply_golden }}
-          APPLY_TEST: ${{ matrix.apply_test }}
+          GOLDEN_PATCH_B64: ${{ inputs.golden_patch_b64 }}
+          BASE_PATCH_B64: ${{ inputs.base_patch_b64 }}
         run: |
           set -euo pipefail
-          mkdir -p /tmp/patches
+          mkdir -p /tmp/patches /tmp/logs
 
-          decode_and_apply () {
+          decode () {
             local name="$1"
             local b64="$2"
-
-            if [[ -z "${b64}" ]]; then
-              echo "Skipping ${name} (empty)"
-              return 0
-            fi
-
-            local path="/tmp/patches/${name}.patch"
-            printf '%s' "${b64}" | base64 -d > "${path}"
-            echo "Applying ${name}: ${path}"
-            git apply --whitespace=nowarn "${path}"
+            [ -z "$b64" ] && return 0
+            printf '%s' "$b64" | base64 -d > "/tmp/patches/$name"
           }
 
-          # Always apply base first (if provided)
-          decode_and_apply "000_base" "${BASE_PATCH_B64}"
+          decode "010_test.patch"   "$TEST_PATCH_B64"
+          decode "020_golden.patch" "$GOLDEN_PATCH_B64"
+          decode "000_base.patch"   "$BASE_PATCH_B64"
 
-          # Conditionally apply golden/test in order
-          if [[ "${APPLY_GOLDEN}" == "true" ]]; then
-            decode_and_apply "010_golden" "${GOLDEN_PATCH_B64}"
-          else
-            echo "Skipping golden (matrix)"
-          fi
-
-          if [[ "${APPLY_TEST}" == "true" ]]; then
-            decode_and_apply "020_test" "${TEST_PATCH_B64}"
-          else
-            echo "Skipping test (matrix)"
-          fi
-
-      - name: Run tests
+      - name: Check1 – (base?) + golden
+        id: check1
         shell: bash
         run: |
+          set +e; set -o pipefail
+          git checkout --force "${{ inputs.commit_sha }}"
+          git reset --hard; git clean -fdx
+
+          APPLY_OK=true
+
+          [ -f /tmp/patches/000_base.patch ] && \
+            git apply /tmp/patches/000_base.patch 2>&1 | tee /tmp/logs/c1_apply.log \
+              || APPLY_OK=false
+
+          [ "$APPLY_OK" = true ] && \
+            git apply /tmp/patches/020_golden.patch 2>&1 | tee -a /tmp/logs/c1_apply.log \
+              || APPLY_OK=false
+
+          if [ "$APPLY_OK" = true ]; then
+            bash -lc "${{ inputs.test_cmd }}" 2>&1 | tee /tmp/logs/c1_test.log
+            echo "c1_exit=${PIPESTATUS[0]}" >>$GITHUB_OUTPUT
+          else
+            echo "c1_exit=100" >>$GITHUB_OUTPUT
+          fi
+
+          echo "c1_apply_ok=$APPLY_OK" >>$GITHUB_OUTPUT
+          exit 0
+
+      - name: Check2 – (base?) + test
+        id: check2
+        shell: bash
+        run: |
+          set +e; set -o pipefail
+          git checkout --force "${{ inputs.commit_sha }}"
+          git reset --hard; git clean -fdx
+
+          APPLY_OK=true
+
+          [ -f /tmp/patches/000_base.patch ] && \
+            git apply /tmp/patches/000_base.patch 2>&1 | tee /tmp/logs/c2_apply.log \
+              || APPLY_OK=false
+
+          [ "$APPLY_OK" = true ] && \
+            git apply /tmp/patches/010_test.patch 2>&1 | tee -a /tmp/logs/c2_apply.log \
+              || APPLY_OK=false
+
+          if [ "$APPLY_OK" = true ]; then
+            bash -lc "${{ inputs.test_cmd }}" 2>&1 | tee /tmp/logs/c2_test.log
+            echo "c2_exit=${PIPESTATUS[0]}" >>$GITHUB_OUTPUT
+          else
+            echo "c2_exit=100" >>$GITHUB_OUTPUT
+          fi
+
+          echo "c2_apply_ok=$APPLY_OK" >>$GITHUB_OUTPUT
+          exit 0
+
+      - name: Check3 – (base?) + golden + test
+        id: check3
+        shell: bash
+        run: |
+          set +e; set -o pipefail
+          git checkout --force "${{ inputs.commit_sha }}"
+          git reset --hard; git clean -fdx
+
+          APPLY_OK=true
+
+          [ -f /tmp/patches/000_base.patch ] && \
+            git apply /tmp/patches/000_base.patch 2>&1 | tee /tmp/logs/c3_apply.log \
+              || APPLY_OK=false
+
+          [ "$APPLY_OK" = true ] && \
+            git apply /tmp/patches/020_golden.patch 2>&1 | tee -a /tmp/logs/c3_apply.log \
+              || APPLY_OK=false
+
+          [ "$APPLY_OK" = true ] && \
+            git apply /tmp/patches/010_test.patch 2>&1 | tee -a /tmp/logs/c3_apply.log \
+              || APPLY_OK=false
+
+          if [ "$APPLY_OK" = true ]; then
+            bash -lc "${{ inputs.test_cmd }}" 2>&1 | tee /tmp/logs/c3_test.log
+            echo "c3_exit=${PIPESTATUS[0]}" >>$GITHUB_OUTPUT
+          else
+            echo "c3_exit=100" >>$GITHUB_OUTPUT
+          fi
+
+          echo "c3_apply_ok=$APPLY_OK" >>$GITHUB_OUTPUT
+          exit 0
+
+      - name: Callback to n8n
+        if: always()
+        shell: bash
+        env:
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          SUBMISSION_ID: ${{ inputs.submission_id }}
+
+          C1_APPLY_OK: ${{ steps.check1.outputs.c1_apply_ok }}
+          C1_EXIT: ${{ steps.check1.outputs.c1_exit }}
+
+          C2_APPLY_OK: ${{ steps.check2.outputs.c2_apply_ok }}
+          C2_EXIT: ${{ steps.check2.outputs.c2_exit }}
+
+          C3_APPLY_OK: ${{ steps.check3.outputs.c3_apply_ok }}
+          C3_EXIT: ${{ steps.check3.outputs.c3_exit }}
+        run: |
           set -euo pipefail
-          bash -lc "${{ inputs.test_cmd }}"
+          tailb(){ [ -f "$1" ] && tail -c 900000 "$1" | base64 -w0 || echo ""; }
+
+          python3 - <<'PY' | curl -sS -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -d @-
+          import json, os
+
+          payload = {
+            "submission_id": os.environ["SUBMISSION_ID"],
+            "repo": os.environ["GITHUB_REPOSITORY"],
+            "github_run": os.environ["GITHUB_RUN_ID"],
+            "commit": "${{ inputs.commit_sha }}",
+
+            "check1_exit": int(os.environ.get("C1_EXIT","100")),
+            "check1_apply_ok": os.environ.get("C1_APPLY_OK") == "true",
+
+            "check2_exit": int(os.environ.get("C2_EXIT","100")),
+            "check2_apply_ok": os.environ.get("C2_APPLY_OK") == "true",
+
+            "check3_exit": int(os.environ.get("C3_EXIT","100")),
+            "check3_apply_ok": os.environ.get("C3_APPLY_OK") == "true",
+          }
+
+          print(json.dumps(payload))
+          PY
+          true
