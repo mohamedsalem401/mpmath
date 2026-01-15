@@ -40,6 +40,33 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          
+      - name: Make runner environment CLI-friendly (history/home)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Ensure HOME is set and writable
+          export HOME="${HOME:-/home/runner}"
+          mkdir -p "$HOME"
+
+          # Create common readline / REPL history files (harmless if unused)
+          touch "$HOME/.python_history" || true
+          touch "$HOME/.mpmath_history" || true
+          touch "$HOME/.history" || true
+          touch "$HOME/.ipython_history" || true
+
+          # Some tools look for XDG locations
+          export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+          export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+          export XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+          mkdir -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
+
+          # Optional: make sure python can write bytecode, caches, etc.
+          mkdir -p "$HOME/.local" "$HOME/.cache/pip" || true
+
+          echo "HOME=$HOME"
+          ls -la "$HOME" | head
 
       - name: Decode patches
         shell: bash
